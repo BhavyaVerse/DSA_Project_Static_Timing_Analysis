@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <iomanip>
 #include <memory>
+#include <chrono>
+#include <limits>
+#include <unordered_map>
 
 #include "Node.h"
 #include "Gate.h"
@@ -245,320 +248,311 @@ TimingAnalyzer::TimingAnalyzer(Circuit& circuit)
 
 void TimingAnalyzer::analyze() {
     cout << "Starting Static Timing Analysis..." << endl;
-    
-    // Reset previous analysis
+ 
     resetAnalysis();
-    
-    // Step 1: Calculate arrival times (forward propagation)
+ 
+    // Step 1: Forward pass — O(V + E)
     cout << "Calculating arrival times..." << endl;
     calculateArrivalTimes();
-    
-    // Step 2: Calculate required times (backward propagation)
+ 
+    // Step 2: Backward pass — O(V + E)
     cout << "Calculating required times..." << endl;
     calculateRequiredTimes();
-    
-    // Step 3: Calculate slack times
+ 
+    // Step 3: Slack — O(V)
     cout << "Calculating slack times..." << endl;
     calculateSlackTimes();
-    
-    // Step 4: Find all timing paths
-    cout << "Finding timing paths..." << endl;
-    findAllPaths();
-    
-    // Step 5: Identify critical paths
-    cout << "Identifying critical paths..." << endl;
+ 
+    // Step 4: Critical path via backtracking — O(V) per path
+    cout << "Finding critical path..." << endl;
     findCriticalPaths();
-    
-    // Step 6: Calculate total delay
+ 
     calculateTotalDelay();
-    
-    // Step 7: Additional analysis
     calculateSlewTimes();
     calculateCapacitance();
     calculateFanoutCounts();
-    
+ 
     cout << "Timing analysis completed!" << endl;
 }
+ 
+
+// FIX 1: Correct Kahn's algorithm for arrival times
+// inDegree[node] = number of gate-input pairs that must be processed
+//                  before this node can be processed
 
 void TimingAnalyzer::calculateArrivalTimes() {
-    // Initialize arrival times for primary inputs
+    unordered_map<string, int> inDegree;
+ 
+    // Initialize all nodes to 0
+    for (const auto& nodePair : circuit.getNodes()) {
+        inDegree[nodePair.first] = 0;
+    }
+ 
+    // FIXED: output node needs ALL inputs of its driving gate processed first
+    for (const auto& gate : circuit.getGates()) {
+        inDegree[gate->getOutput()] += gate->getInputs().size();
+    }
+ 
+    // Primary inputs have in-degree 0 - seed the queue
+    queue<string> processQueue;
     for (const auto& input : circuit.getPrimaryInputs()) {
         auto node = circuit.getNode(input);
         if (node) {
             node->setArrivalTimeRise(0.0);
             node->setArrivalTimeFall(0.0);
             arrivalTimes[input] = 0.0;
+            processQueue.push(input);
         }
     }
-    
-    // Topological sort for forward propagation
-    queue<string> processQueue;
-    map<string, int> inDegree;
-    
-    // Calculate in-degrees
-    for (const auto& gate : circuit.getGates()) {
-        for (const auto& input : gate->getInputs()) {
-            inDegree[input]++;
-        }
-    }
-    
-    // Add primary inputs to queue
-    for (const auto& input : circuit.getPrimaryInputs()) {
-        processQueue.push(input);
-    }
-    
-    // Process nodes in topological order
+ 
     while (!processQueue.empty()) {
         string currentNode = processQueue.front();
         processQueue.pop();
-        
+ 
         auto node = circuit.getNode(currentNode);
         if (!node) continue;
-        
-        // Process all fanout gates
+ 
         for (const auto& gate : node->getFanouts()) {
-            // Calculate arrival time at gate output
-            vector<double> inputArrivalTimes;
+            // Collect max arrival time across all gate inputs
+            double maxInputArrival = 0.0;
+            bool allInputsReady = true;
+ 
             for (const auto& input : gate->getInputs()) {
-                auto inputNode = circuit.getNode(input);
-                if (inputNode) {
-                    inputArrivalTimes.push_back(inputNode->getMaxArrivalTime());
+                auto it = arrivalTimes.find(input);
+                if (it == arrivalTimes.end()) {
+                    allInputsReady = false;
+                    break;
                 }
+                maxInputArrival = max(maxInputArrival, it->second);
             }
-            
-            // Set gate delay from circuit configuration
-            double gateDelay = circuit.getGateDelay(gate->getType());
-            gate->setDelay(gateDelay);
-            double outputArrivalTime = gate->calculateDelay(inputArrivalTimes);
-            
-            // Update output node
-            string outputNode = gate->getOutput();
-            auto outputNodePtr = circuit.getNode(outputNode);
-            if (outputNodePtr) {
-                outputNodePtr->setArrivalTimeRise(outputArrivalTime);
-                outputNodePtr->setArrivalTimeFall(outputArrivalTime);
-                arrivalTimes[outputNode] = outputArrivalTime;
-            }
-            
-            // Decrease in-degree for output node
-            inDegree[outputNode]--;
-            if (inDegree[outputNode] == 0) {
-                processQueue.push(outputNode);
+ 
+            // Decrement counter; only process when all inputs are ready
+            inDegree[gate->getOutput()]--;
+            if (inDegree[gate->getOutput()] == 0) {
+                double gateDelay = circuit.getGateDelay(gate->getType());
+                gate->setDelay(gateDelay);
+ 
+                vector<double> inputArrivals;
+                for (const auto& input : gate->getInputs()) {
+                    auto inputNode = circuit.getNode(input);
+                    if (inputNode)
+                        inputArrivals.push_back(inputNode->getMaxArrivalTime());
+                }
+ 
+                double outputArrival = gate->calculateDelay(inputArrivals);
+                string outputName = gate->getOutput();
+                auto outputNode = circuit.getNode(outputName);
+                if (outputNode) {
+                    outputNode->setArrivalTimeRise(outputArrival);
+                    outputNode->setArrivalTimeFall(outputArrival);
+                    arrivalTimes[outputName] = outputArrival;
+                }
+ 
+                processQueue.push(outputName);
             }
         }
     }
 }
+ 
+
+// FIX 2: Correct backward BFS for required times
+// outDegree[node] = number of gates that use this node as input
 
 void TimingAnalyzer::calculateRequiredTimes() {
-    // Initialize required times for primary outputs
     double clockPeriod = circuit.getClockPeriod();
+    unordered_map<string, int> outDegree;
+ 
+    // Initialize all nodes to 0
+    for (const auto& nodePair : circuit.getNodes()) {
+        outDegree[nodePair.first] = 0;
+    }
+ 
+    // FIXED: count how many gates use each node as an input
+    for (const auto& gate : circuit.getGates()) {
+        for (const auto& input : gate->getInputs()) {
+            outDegree[input]++;
+        }
+    }
+ 
+    // Primary outputs seed the backward queue
+    queue<string> processQueue;
     for (const auto& output : circuit.getPrimaryOutputs()) {
         auto node = circuit.getNode(output);
         if (node) {
             node->setRequiredTimeRise(clockPeriod);
             node->setRequiredTimeFall(clockPeriod);
             requiredTimes[output] = clockPeriod;
+            processQueue.push(output);
         }
     }
-    
-    // Backward propagation using reverse topological order
-    queue<string> processQueue;
-    map<string, int> outDegree;
-    
-    // Calculate out-degrees
-    for (const auto& gate : circuit.getGates()) {
-        outDegree[gate->getOutput()]++;
-    }
-    
-    // Add primary outputs to queue
-    for (const auto& output : circuit.getPrimaryOutputs()) {
-        processQueue.push(output);
-    }
-    
-    // Process nodes in reverse topological order
+ 
     while (!processQueue.empty()) {
         string currentNode = processQueue.front();
         processQueue.pop();
-        
+ 
         auto node = circuit.getNode(currentNode);
         if (!node) continue;
-        
-        // Process fanin gate
+ 
         auto faninGate = node->getFanin();
-        if (faninGate) {
-            double gateDelay = circuit.getGateDelay(faninGate->getType());
-            double inputRequiredTime = node->getMinRequiredTime() - gateDelay;
-            
-            // Update input nodes
-            for (const auto& input : faninGate->getInputs()) {
-                auto inputNode = circuit.getNode(input);
-                if (inputNode) {
-                    inputNode->setRequiredTimeRise(inputRequiredTime);
-                    inputNode->setRequiredTimeFall(inputRequiredTime);
-                    requiredTimes[input] = inputRequiredTime;
-                }
-                
-                // Decrease out-degree for input node
-                outDegree[input]--;
-                if (outDegree[input] == 0) {
-                    processQueue.push(input);
-                }
+        if (!faninGate) continue;
+ 
+        double gateDelay = circuit.getGateDelay(faninGate->getType());
+        double inputRequired = node->getMinRequiredTime() - gateDelay;
+ 
+        for (const auto& input : faninGate->getInputs()) {
+            auto inputNode = circuit.getNode(input);
+            if (inputNode) {
+                // Take the most conservative (minimum) required time
+                double existing = inputNode->getMinRequiredTime();
+                double updated  = min(existing, inputRequired);
+                inputNode->setRequiredTimeRise(updated);
+                inputNode->setRequiredTimeFall(updated);
+                requiredTimes[input] = updated;
+            }
+ 
+            outDegree[input]--;
+            if (outDegree[input] == 0) {
+                processQueue.push(input);
             }
         }
     }
 }
+ 
 
+// FIX 3: O(V) critical path backtracking — no exponential enumeration
+// Backtracks from the primary output with worst slack,
+// choosing at each gate the input with the latest arrival time.
+
+void TimingAnalyzer::findCriticalPaths() {
+    criticalPaths.clear();
+ 
+    // Find primary output with worst (most negative) slack
+    string worstOutput;
+    double worstSlackVal = numeric_limits<double>::max();
+ 
+    for (const auto& output : circuit.getPrimaryOutputs()) {
+        auto node = circuit.getNode(output);
+        if (node && node->getWorstSlack() < worstSlackVal) {
+            worstSlackVal = node->getWorstSlack();
+            worstOutput   = output;
+        }
+    }
+ 
+    if (worstOutput.empty()) return;
+ 
+    // Backtrack from worst output to primary input
+    TimingPath path;
+    path.slack      = worstSlackVal;
+    path.isCritical = (worstSlackVal <= 0.0);
+ 
+    string current = worstOutput;
+    while (true) {
+        path.nodes.push_back(current);
+        auto node = circuit.getNode(current);
+        if (!node) break;
+ 
+        auto faninGate = node->getFanin();
+        if (!faninGate) break;  // reached primary input
+ 
+        // Choose input with the latest arrival time
+        string bestInput;
+        double bestArrival = -1.0;
+        for (const auto& input : faninGate->getInputs()) {
+            auto it = arrivalTimes.find(input);
+            if (it != arrivalTimes.end() && it->second > bestArrival) {
+                bestArrival = it->second;
+                bestInput   = input;
+            }
+        }
+        if (bestInput.empty()) break;
+        current = bestInput;
+    }
+ 
+    // Reverse so path runs input => output
+    reverse(path.nodes.begin(), path.nodes.end());
+    path.totalDelay = calculatePathDelay(path.nodes);
+    criticalPaths.push_back(path);
+}
+ 
 void TimingAnalyzer::calculateSlackTimes() {
     for (const auto& nodePair : circuit.getNodes()) {
         const string& nodeName = nodePair.first;
         auto node = nodePair.second;
-        
-        double arrivalTime = node->getMaxArrivalTime();
-        double requiredTime = node->getMinRequiredTime();
-        double slack = requiredTime - arrivalTime;
-        
+ 
+        double slack = node->getMinRequiredTime() - node->getMaxArrivalTime();
         node->setSlackRise(slack);
         node->setSlackFall(slack);
         slackTimes[nodeName] = slack;
     }
-    
+ 
     updateWorstSlack();
 }
-
-void TimingAnalyzer::findAllPaths() {
-    allPaths.clear();
-    
-    for (const auto& input : circuit.getPrimaryInputs()) {
-        vector<string> currentPath;
-        map<string, bool> visited;
-        findPathsRecursive(input, currentPath, visited);
-    }
-}
-
-void TimingAnalyzer::findPathsRecursive(const string& currentNode, 
-                                       vector<string>& currentPath,
-                                       map<string, bool>& visited) {
-    if (visited[currentNode]) return; // Avoid cycles
-    
-    visited[currentNode] = true;
-    currentPath.push_back(currentNode);
-    
-    auto node = circuit.getNode(currentNode);
-    if (!node) return;
-    
-    // If this is a primary output, we found a complete path
-    if (node->isOutput()) {
-        TimingPath path;
-        path.nodes = currentPath;
-        path.totalDelay = calculatePathDelay(currentPath);
-        path.slack = node->getWorstSlack();
-        path.isCritical = (path.slack <= 0.0);
-        allPaths.push_back(path);
-    } else {
-        // Continue with fanout gates
-        for (const auto& gate : node->getFanouts()) {
-            string nextNode = gate->getOutput();
-            findPathsRecursive(nextNode, currentPath, visited);
-        }
-    }
-    
-    // Backtrack
-    visited[currentNode] = false;
-    currentPath.pop_back();
-}
-
+ 
 double TimingAnalyzer::calculatePathDelay(const vector<string>& path) const {
-    double totalDelay = 0.0;
-    
-    for (size_t i = 0; i < path.size() - 1; ++i) {
+    double total = 0.0;
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
         auto node = circuit.getNode(path[i]);
         if (!node) continue;
-        
         for (const auto& gate : node->getFanouts()) {
             if (gate->getOutput() == path[i + 1]) {
-                totalDelay += circuit.getGateDelay(gate->getType());
+                total += circuit.getGateDelay(gate->getType());
                 break;
             }
         }
     }
-    
-    return totalDelay;
+    return total;
 }
-
-void TimingAnalyzer::findCriticalPaths() {
-    criticalPaths.clear();
-    
-    for (const auto& path : allPaths) {
-        if (path.isCritical) {
-            criticalPaths.push_back(path);
-        }
-    }
-    
-    // Sort by slack (most critical first)
-    sort(criticalPaths.begin(), criticalPaths.end(),
-              [](const TimingPath& a, const TimingPath& b) {
-                  return a.slack < b.slack;
-              });
-}
-
+ 
 void TimingAnalyzer::calculateTotalDelay() {
     totalDelay = 0.0;
-    
-    for (const auto& path : allPaths) {
-        totalDelay = max(totalDelay, path.totalDelay);
+    for (const auto& output : circuit.getPrimaryOutputs()) {
+        auto it = arrivalTimes.find(output);
+        if (it != arrivalTimes.end())
+            totalDelay = max(totalDelay, it->second);
     }
 }
-
+ 
 void TimingAnalyzer::calculateSlewTimes() {
-    // Simple slew calculation 
     for (const auto& nodePair : circuit.getNodes()) {
         auto node = nodePair.second;
-        double arrivalTime = node->getMaxArrivalTime();
-        node->setSlewRise(arrivalTime * 0.1); // 10% of arrival time
-        node->setSlewFall(arrivalTime * 0.1);
+        double t = node->getMaxArrivalTime();
+        node->setSlewRise(t * 0.1);
+        node->setSlewFall(t * 0.1);
     }
 }
-
+ 
 void TimingAnalyzer::calculateCapacitance() {
     for (const auto& nodePair : circuit.getNodes()) {
         auto node = nodePair.second;
-        double capacitance = 1.0 + node->getFanouts().size() * 0.5;
-        node->setCapacitance(capacitance);
+        node->setCapacitance(1.0 + node->getFanouts().size() * 0.5);
     }
 }
-
+ 
 void TimingAnalyzer::calculateFanoutCounts() {
     for (const auto& nodePair : circuit.getNodes()) {
         auto node = nodePair.second;
         node->setFanoutCount(node->getFanouts().size());
     }
 }
-
-
-
+ 
 void TimingAnalyzer::updateWorstSlack() {
-    worstSlack = 0.0;
-    
-    for (const auto& slackPair : slackTimes) {
-        worstSlack = min(worstSlack, slackPair.second);
-    }
+    worstSlack = numeric_limits<double>::max();
+    for (const auto& p : slackTimes)
+        worstSlack = min(worstSlack, p.second);
+    if (worstSlack == numeric_limits<double>::max()) worstSlack = 0.0;
 }
-
+ 
 void TimingAnalyzer::resetAnalysis() {
-    allPaths.clear();
     criticalPaths.clear();
     arrivalTimes.clear();
     requiredTimes.clear();
     slackTimes.clear();
-    worstSlack = 0.0;
-    totalDelay = 0.0;
-    
-    // Reset node timing
-    for (const auto& nodePair : circuit.getNodes()) {
+    worstSlack  = 0.0;
+    totalDelay  = 0.0;
+    for (const auto& nodePair : circuit.getNodes())
         nodePair.second->resetTiming();
-    }
 }
-
+ 
 bool TimingAnalyzer::isTimingViolation() const {
     return worstSlack < 0.0;
 }
@@ -651,9 +645,19 @@ void TimingAnalyzer::printDetailedReport() {
 
 void TimingAnalyzer::printTimingPath(const TimingPath& path) const {
     cout << "Path (Slack: " << path.slack << " ns): ";
-    for (size_t i = 0; i < path.nodes.size(); ++i) {
-        cout << path.nodes[i];
-        if (i < path.nodes.size() - 1) cout << " -> ";
+    
+    // If the path is massive, just print the beginning and end
+    if (path.nodes.size() > 10) {
+        cout << path.nodes.front() << " -> ... [" 
+             << path.nodes.size() - 2 << " internal gates] ... -> " 
+             << path.nodes.back();
+    } 
+    // If it's a normal sized path, print the whole thing
+    else {
+        for (size_t i = 0; i < path.nodes.size(); ++i) {
+            cout << path.nodes[i];
+            if (i < path.nodes.size() - 1) cout << " -> ";
+        }
     }
     cout << " (Delay: " << path.totalDelay << " ns)" << endl;
 }
@@ -661,13 +665,11 @@ void TimingAnalyzer::printTimingPath(const TimingPath& path) const {
 // ============================================================================
 // MAIN FUNCTION
 // ============================================================================
-
 int main() {
     // Hardcoded file paths - we can change these to use different input files
-    string circuitFile = "../examples/complex_circuit.txt";
-    string delayFile = "../delays/gate_delays.txt";
-    string outputFile = "../reports/timing_report.txt";
-    // Create circuit and load configuration
+    string circuitFile = "examples/massive_circuit.txt";
+    string delayFile = "delays/gate_delays.txt";
+    string outputFile = "reports/timing_report.txt";
    
     try {
         // Creating circuit and load configuration
@@ -678,9 +680,17 @@ int main() {
         // Creating timing analyzer
         TimingAnalyzer analyzer(circuit);
 
-        // Performing timing analysis
         cout << "Performing Static Timing Analysis..." << endl;
+
+        // --- START TIMER ---
+        auto start = chrono::high_resolution_clock::now();
+
+        // Performing timing analysis
         analyzer.analyze();
+
+        // --- STOP TIMER ---
+        auto end = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::milliseconds>(end - start);
 
         // Generating timing report
         analyzer.generateReport(outputFile);
@@ -688,6 +698,11 @@ int main() {
 
         // Printing summary to console
         analyzer.printSummary();
+
+        // --- PRINTING METRICS ---
+        cout << "\n====================================\n";
+        cout << "Execution Time: " << duration.count() << " ms\n";
+        cout << "====================================\n";
 
     } catch (const exception& e) {
         cerr << "Error: " << e.what() << endl;
